@@ -57,7 +57,12 @@ struct Server {
         j.Member("hoverProvider", true);
         j.Member("definitionProvider", true);
         j.Member("referencesProvider", true);
-        j.Member("renameProvider", true);
+        j.Key("renameProvider");
+        j.BeginObject();
+        j.Member("prepareProvider", true);
+        j.EndObject();
+        j.Member("documentHighlightProvider", true);
+        j.Member("typeDefinitionProvider", true);
         j.Member("documentSymbolProvider", true);
         j.Member("workspaceSymbolProvider", true);
         j.Member("callHierarchyProvider", true);
@@ -65,6 +70,18 @@ struct Server {
         j.Member("foldingRangeProvider", true);
         j.Member("selectionRangeProvider", true);
         j.Member("documentFormattingProvider", true);
+        j.Member("documentRangeFormattingProvider", true);
+        j.Key("codeActionProvider");
+        j.BeginObject();
+        j.Key("codeActionKinds");
+        j.BeginArray();
+        j.Str("source.format");
+        j.Str("refactor.extract");
+        j.Str("refactor.inline");
+        j.Str("refactor.rewrite");
+        j.Str("quickfix");
+        j.EndArray();
+        j.EndObject();
         j.Key("codeLensProvider");
         j.BeginObject();
         j.Member("resolveProvider", false);
@@ -118,7 +135,7 @@ struct Server {
         if (method.rfind("textDocument/", 0) != 0 && method.rfind("callHierarchy/", 0) != 0 &&
             method != "workspace/symbol") return false;
         // Formatting reads the editor's text, not an analysis.
-        if (method == "textDocument/formatting") return false;
+        if (method == "textDocument/formatting" || method == "textDocument/rangeFormatting") return false;
         for (auto feature : { "codeLens", "semanticTokens", "inlayHint" })
             if (method.rfind(cat("textDocument/", feature), 0) == 0)
                 return find(ws.refreshes.begin(), ws.refreshes.end(), cat("workspace/", feature, "/refresh")) ==
@@ -146,6 +163,10 @@ struct Server {
                 for (auto &c : commands->arr)
                     if (c.kind == Json::STRING) ws.clientcommands.insert(c.str);
             auto caps = p.Get("capabilities");
+            auto tcaps = caps ? caps->Get("textDocument") : nullptr;
+            auto ccaps = tcaps ? tcaps->Get("completion") : nullptr;
+            auto icaps = ccaps ? ccaps->Get("completionItem") : nullptr;
+            ws.snippetSupport = JsonBool(icaps ? icaps->Get("snippetSupport") : nullptr);
             auto wcaps = caps ? caps->Get("workspace") : nullptr;
             for (auto feature : { "codeLens", "semanticTokens", "inlayHint" }) {
                 auto fcaps = wcaps ? wcaps->Get(feature) : nullptr;
@@ -160,11 +181,11 @@ struct Server {
             return false;
         } else if (method == "textDocument/didOpen") {
             auto td = p.Get("textDocument");
-            if (td) ws.Open(JsonStr(td->Get("uri")), JsonStr(td->Get("text")));
+            if (td) ws.Open(JsonStr(td->Get("uri")), JsonStr(td->Get("text")), JsonInt(td->Get("version")));
         } else if (method == "textDocument/didChange") {
             auto td = p.Get("textDocument");
             auto changes = p.Get("contentChanges");
-            if (td && changes) ws.ChangeEdits(JsonStr(td->Get("uri")), *changes);
+            if (td && changes) ws.ChangeEdits(JsonStr(td->Get("uri")), *changes, JsonInt(td->Get("version")));
         } else if (method == "textDocument/didClose") {
             if (auto td = p.Get("textDocument")) ws.Close(JsonStr(td->Get("uri")));
         } else if (method == "workspace/didChangeConfiguration") {
@@ -192,6 +213,12 @@ struct Server {
             Respond(m, [&](JsonOut &j) { return Completion(ws, p, j); });
         } else if (method == "textDocument/references") {
             Respond(m, [&](JsonOut &j) { return References(ws, p, j); });
+        } else if (method == "textDocument/prepareRename") {
+            Respond(m, [&](JsonOut &j) { return PrepareRename(ws, p, j); });
+        } else if (method == "textDocument/documentHighlight") {
+            Respond(m, [&](JsonOut &j) { return DocumentHighlights(ws, p, j); });
+        } else if (method == "textDocument/typeDefinition") {
+            Respond(m, [&](JsonOut &j) { return TypeDefinition(ws, p, j); });
         } else if (method == "textDocument/rename") {
             // A name that cannot be renamed is an error the editor shows,
             // not an empty edit.
@@ -213,10 +240,12 @@ struct Server {
             Respond(m, [&](JsonOut &j) { return SelectionRanges(ws, p, j); });
         } else if (method == "textDocument/codeLens") {
             Respond(m, [&](JsonOut &j) { return CodeLenses(ws, p, j); });
-        } else if (method == "textDocument/formatting") {
+        } else if (method == "textDocument/codeAction") {
+            Respond(m, [&](JsonOut &j) { return CodeActions(ws, p, j); });
+        } else if (method == "textDocument/formatting" || method == "textDocument/rangeFormatting") {
             JsonOut edits;
             string error;
-            auto r = FormatDocument(ws, p, edits, error);
+            auto r = FormatDocument(ws, p, edits, error, method == "textDocument/rangeFormatting");
             if (r == 2) RespondError(m, -32603, error);
             else Respond(m, [&](JsonOut &j) { if (r) j.Raw(edits.s); return r == 1; });
         } else if (!m.id.empty()) {

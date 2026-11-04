@@ -498,8 +498,11 @@ def check_lsp_protocol(exe, base):
     def close_doc(path):
         client.send("textDocument/didClose", {"textDocument": {"uri": uri_of(path)}}, request=False)
 
+    versions = {}
+
     def change_doc(path, body):
-        client.send("textDocument/didChange", {"textDocument": {"uri": uri_of(path), "version": 2},
+        versions[path] = versions.get(path, 1) + 1
+        client.send("textDocument/didChange", {"textDocument": {"uri": uri_of(path), "version": versions[path]},
                                                "contentChanges": [{"text": body}]}, request=False)
 
     def lib_error(when):
@@ -620,8 +623,166 @@ def check_lsp_protocol(exe, base):
             ("incoming 8:4", callers("8:4"), ["two_shared.goose:apply@13"])):
         if got != want:
             fail(f"two entry files: {what} are not {want}", got)
+    plain = two.request("textDocument/completion", {**sdoc, "position": position("5:4")})
+    items = plain if isinstance(plain, list) else plain.get("items", [])
+    if any(item.get("insertTextFormat") == 2 for item in items):
+        fail("snippets were sent without client support", items)
     two.request("shutdown", None)
     two.send("exit", request=False)
     code = two.p.wait(timeout=30)
     if code != 0:
         raise RuntimeError(f"goose lsp exited with {code}:\n{tc.decode(two.p.stderr.read())}")
+
+    check_editing_features(exe, base / "editing")
+
+
+def check_editing_features(exe, base):
+    """Apply checked edits and compare the resulting programs' output."""
+    base.mkdir(parents=True, exist_ok=True)
+    main = base / "main.goose"
+    helper = base / "editing_helper.goose"
+    helper.write_text("namespace editing_helper;\nfn calculate(x: i64) -> i64 { let inline_argument_0 = 20; return x + inline_argument_0; }\n")
+    text = ("import std;\nimport editing_helper;\n"
+            "struct Point { x: i64 }\ntype Alias = Point;\n"
+            "fn show(value: Alias) -> i64 { value.x }\n"
+            "fn not(x: bool) -> bool { x }\n"
+            "fn main() {\n    let first = 1;\n    let second = 2;\n"
+            "    print(first + second);\n    print(editing_helper::calculate(4));\n"
+            "    print(true.not());\n    print(show(Point { 3 }));\n}\n")
+    main.write_text(text)
+    uri = uri_of(main)
+    doc = {"textDocument": {"uri": uri}}
+
+    def at(body, needle, offset=0):
+        before = body[:body.index(needle) + offset]
+        return {"line": before.count("\n"), "character": len(before.rsplit("\n", 1)[-1])}
+
+    def pos(needle, offset=0):
+        return at(text, needle, offset)
+
+    def apply(body, edits):
+        lines = body.splitlines(keepends=True)
+        def offset(p):
+            prefix = (lines[p["line"]] if p["line"] < len(lines) else "").encode("utf-16-le")[:p["character"] * 2]
+            return sum(len(line) for line in lines[:p["line"]]) + len(prefix.decode("utf-16-le"))
+        for edit in sorted(edits, key=lambda e: offset(e["range"]["start"]), reverse=True):
+            body = body[:offset(edit["range"]["start"])] + edit["newText"] + body[offset(edit["range"]["end"]):]
+        return body
+
+    def run(body):
+        main.write_text(body)
+        code, out, err = tc.run_capture([exe, "run", str(main), "--offline"])
+        if code:
+            raise RuntimeError(f"editing result does not run:\n{out}{err}")
+        return out
+
+    baseline = run(text)
+    client = Client(exe, base)
+    candidates = []
+    try:
+        caps = client.request("initialize", {
+            "rootUri": uri_of(base),
+            "capabilities": {"textDocument": {"completion": {"completionItem": {"snippetSupport": True}}}},
+            "initializationOptions": {"entryFiles": [str(main)]}})["capabilities"]
+        for name in ("documentHighlightProvider", "typeDefinitionProvider", "documentRangeFormattingProvider"):
+            if not caps.get(name):
+                raise RuntimeError(f"editing capability missing: {name}")
+        client.send("initialized", {}, request=False)
+        client.send("textDocument/didOpen", {"textDocument": {
+            "uri": uri, "languageId": "goose", "version": 1, "text": text}}, request=False)
+        if client.diagnostics_for(uri):
+            raise RuntimeError("editing fixture has diagnostics")
+        prepared = client.request("textDocument/prepareRename", {**doc, "position": pos("first")})
+        if not prepared:
+            raise RuntimeError("prepareRename failed")
+        highlights = client.request("textDocument/documentHighlight", {**doc, "position": pos("first")})
+        if len(highlights or []) != 2:
+            raise RuntimeError(f"binding highlights are wrong: {highlights}")
+        start = pos("editing_helper::calculate(4)")
+        end = pos("editing_helper::calculate(4)", len("editing_helper::calculate(4)"))
+        actions = client.request("textDocument/codeAction", {
+            **doc, "range": {"start": start, "end": end}, "context": {"diagnostics": []}})
+        inline = next((a for a in actions or [] if a["title"] == "Inline resolved scalar call"), None)
+        if not inline:
+            raise RuntimeError(f"imported inline action missing: {actions}")
+        changes = inline["edit"]["documentChanges"]
+        if len(changes) != 1 or changes[0]["textDocument"] != {"uri": uri, "version": 1}:
+            raise RuntimeError(f"inline is not versioned: {inline}")
+        candidates.append(changes[0]["edits"])
+        completion = client.request("textDocument/completion", {**doc, "position": pos("true.not", 8)})
+        items = completion if isinstance(completion, list) else completion.get("items", [])
+        method = next((i for i in items if i["label"] == "not"), None)
+        if not method or "!(" in json.dumps(method):
+            raise RuntimeError(f"postfix masks an existing callable: {items}")
+        target = client.request("textDocument/typeDefinition", {**doc, "position": pos("value: Alias")})
+        if len(target or []) != 1 or target[0]["range"]["start"] != pos("Point { x"):
+            raise RuntimeError(f"alias type navigation has wrong target: {target}")
+        ranges = {json.dumps(h["range"], sort_keys=True) for h in highlights}
+        expected = {json.dumps({"start": pos(n), "end": pos(n, 5)}, sort_keys=True)
+                    for n in ("first =", "first +")}
+        if ranges != expected:
+            raise RuntimeError(f"highlight ranges are wrong: {highlights}")
+        messy = "fn main() {\n let a=1;\n\n let b=2;\n}\n"
+        client.send("textDocument/didChange", {"textDocument": {"uri": uri, "version": 2},
+                    "contentChanges": [{"text": messy}]}, request=False)
+        edits = client.request("textDocument/rangeFormatting", {
+            **doc, "range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}},
+            "options": {"tabSize": 4, "insertSpaces": True}})
+        if not edits or apply(messy, edits) != "fn main() {\n    let a = 1;\n\n let b=2;\n}\n":
+            raise RuntimeError(f"range formatting changed lines outside the selection: {edits}")
+        remote = base / "remote.goose"
+        remote_text = ('namespace remote;\nfn initialize() -> i64 { print("init"); 9 }\n'
+                       'let initialized = initialize();\nfn value() -> i64 { initialized }\n')
+        remote.write_text(remote_text)
+        client.send("textDocument/didOpen", {"textDocument": {
+            "uri": uri_of(remote), "languageId": "goose", "version": 1, "text": remote_text}}, request=False)
+        for version, replacement, label, requires in (
+                (3, "remote::va()", "remote::value", None),
+                (4, "probe", "probe", ["remote::value"]),
+                (5, "probe", "probe", ["missing::value"])):
+            body = text.replace("first + second", replacement)
+            client.send("workspace/didChangeConfiguration", {"settings": {"goose": {"snippets": [{
+                "prefix": "probe", "body": "${1:remote::value()}$0", "scope": "expression",
+                "postfix": False, "requires": requires or []}]}}}, request=False)
+            client.send("textDocument/didChange", {"textDocument": {"uri": uri, "version": version},
+                        "contentChanges": [{"text": body}]}, request=False)
+            result = client.request("textDocument/completion", {**doc, "position": at(body, replacement,
+                len(replacement) - (2 if version == 3 else 0))})
+            items = result if isinstance(result, list) else result.get("items", [])
+            item = next((i for i in items if i["label"] == label), None)
+            if version == 5:
+                if item: raise RuntimeError(f"missing snippet requirement was accepted: {item}")
+                continue
+            if not item: raise RuntimeError(f"import completion missing in case {version}: {items}")
+            edit = dict(item["textEdit"])
+            if version == 4:
+                if item.get("insertTextFormat") != 2: raise RuntimeError("snippet not negotiated")
+                edit["newText"] = "remote::value()"
+            updated = apply(body, [edit, *item.get("additionalTextEdits", [])])
+            if run(updated) != "init\n9\n24\ntrue\n3\n":
+                raise RuntimeError("import completion changed initialization or runtime output")
+        changed = text.replace("first", "updated")
+        client.send("textDocument/didChange", {"textDocument": {"uri": uri, "version": 6},
+                    "contentChanges": [{"text": changed}]}, request=False)
+        client.request("textDocument/documentSymbol", doc)
+        for version in (5, 6):
+            client.send("textDocument/didChange", {"textDocument": {"uri": uri, "version": version},
+                        "contentChanges": [{"text": text}]}, request=False)
+        hover = client.request("textDocument/hover", {**doc, "position": pos("first")})
+        if not hover or "updated" not in hover["contents"]["value"]:
+            raise RuntimeError(f"stale document version replaced current text: {hover}")
+        client.request("shutdown", None)
+        client.send("exit", request=False)
+        if client.p.wait(timeout=30):
+            raise RuntimeError("editing server failed to shut down")
+    finally:
+        if client.p.poll() is None:
+            client.p.kill()
+            client.p.wait(timeout=30)
+
+    try:
+        for edits in candidates:
+            if run(apply(text, edits)) != baseline:
+                raise RuntimeError("checked edit changed runtime output")
+    finally:
+        main.write_text(text)

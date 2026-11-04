@@ -14,9 +14,57 @@ void ParseProgram(Ast &ast, const string &rootpath, const vector<string> &stdlib
                   const string &exedir, const SourceProvider &sources);
 int RunOnCompilerStack(const function<int()> &fn);
 
+inline bool ExpandSimpleSnippet(const string &body, string &expanded) {
+    vector<pair<bool, string>> parts;
+    map<string, string> defaults;
+    auto escaped = [&](size_t n) {
+        return body[n] == '\\' && n + 1 < body.size() &&
+            (body[n + 1] == '$' || body[n + 1] == '}' || body[n + 1] == '\\');
+    };
+    for (size_t i = 0; i < body.size();) {
+        if (escaped(i)) {
+            parts.emplace_back(false, string(1, body[i + 1]));
+            i += 2; continue;
+        }
+        if (body[i] != '$') {
+            parts.emplace_back(false, string(1, body[i++])); continue;
+        }
+        auto n = i + 1;
+        bool brace = n < body.size() && body[n] == '{';
+        if (brace) n++;
+        auto digits = n;
+        while (n < body.size() && isdigit((unsigned char)body[n])) n++;
+        if (digits == n) return false;
+        auto index = body.substr(digits, n - digits);
+        auto nonzero = index.find_first_not_of('0');
+        index = nonzero == string::npos ? "0" : index.substr(nonzero);
+        if (brace) {
+            if (n < body.size() && body[n] == ':') {
+                n++;
+                string value;
+                while (n < body.size() && body[n] != '}') {
+                    if (body[n] == '$' || body[n] == '{') return false;
+                    if (escaped(n)) n++;
+                    value += body[n++];
+                }
+                auto [it, inserted] = defaults.emplace(index, value);
+                if (!inserted && it->second != value) return false;
+            }
+            if (n == body.size() || body[n] != '}') return false;
+            n++;
+        }
+        parts.emplace_back(true, index);
+        i = n;
+    }
+    for (auto &[placeholder, value] : parts)
+        expanded += placeholder ? defaults[value] : value;
+    return true;
+}
+
 struct Document {
     string path;        // Canonical.
     string text;
+    int64_t version = 0;
 };
 
 // A diagnostic as the protocol's JSON. Its key, the range, severity and
@@ -54,6 +102,13 @@ struct Workspace {
     // protocol has no way to ask, so its initialization options list them
     // (`commands`).
     set<string> clientcommands;
+    bool snippetSupport = false;
+    struct CustomSnippet {
+        string prefix, body, description, scope;
+        bool postfix;
+        vector<string> requirements;
+    };
+    vector<CustomSnippet> customSnippets;
     // The refresh requests the client takes (`workspace/codeLens/refresh`,
     // `workspace/semanticTokens/refresh`, `workspace/inlayHint/refresh`),
     // and the id of the last request the server sent.
@@ -111,6 +166,49 @@ struct Workspace {
     // `stdlib`, the standard library's directory.
     void Configure(const Json *options) {
         if (!options || options->kind != Json::OBJECT) return;
+        customSnippets.clear();
+        if (auto list = options->Get("snippets"); list && list->kind == Json::ARRAY) {
+            for (auto &entry : list->arr) {
+                auto prefix = entry.Get("prefix"), body = entry.Get("body");
+                auto scope = entry.Get("scope"), mode = entry.Get("postfix");
+                auto description = entry.Get("description");
+                if (!prefix || prefix->kind != Json::STRING || prefix->str.empty() ||
+                    !body || body->kind != Json::STRING || body->str.empty() ||
+                    !scope || scope->kind != Json::STRING || (scope->str != "expression" && scope->str != "item" && scope->str != "type") ||
+                    !mode || mode->kind != Json::BOOL ||
+                    (description && description->kind != Json::STRING)) continue;
+                bool valid = true;
+                for (auto c : prefix->str) if (!isalnum((unsigned char)c) && c != '_') valid = false;
+                auto receiver = body->str.find("${receiver}");
+                bool postfix = JsonBool(mode);
+                if (postfix && scope->str != "expression") continue;
+                if (postfix ? receiver == string::npos ||
+                    body->str.find("${receiver}", receiver + 11) != string::npos : receiver != string::npos) continue;
+                if (postfix) {
+                    auto before = body->str.substr(0, receiver);
+                    auto after = body->str.substr(receiver + 11);
+                    if (after.size() >= 2 && after.substr(after.size() - 2) == "$0") after.resize(after.size() - 2);
+                    for (char c : before)
+                        if (!isalnum((unsigned char)c) && c != '_' && c != ':' &&
+                            c != '(' && !isspace((unsigned char)c) && c != '!' && c != '-' && c != '+') valid = false;
+                    for (char c : after) if (c != ')' && !isspace((unsigned char)c)) valid = false;
+                }
+                vector<string> requirements;
+                if (auto list = entry.Get("requires")) {
+                    if (list->kind != Json::ARRAY) continue;
+                    for (auto &value : list->arr) {
+                        if (value.kind != Json::STRING || value.str.empty()) valid = false;
+                        else requirements.push_back(value.str);
+                    }
+                }
+                auto validationBody = body->str;
+                if (postfix) validationBody.replace(receiver, 11, "0");
+                string expanded;
+                if (!ExpandSimpleSnippet(validationBody, expanded)) valid = false;
+                if (valid) customSnippets.push_back({prefix->str, body->str,
+                    description ? description->str : "custom snippet", scope->str, postfix, requirements});
+            }
+        }
         if (auto lib = options->Get("stdlib"); lib && lib->kind == Json::STRING && !lib->str.empty())
             stdlibdirs = StdlibDirs(lib->str, exe);
         if (auto entries = options->Get("entryFiles"); entries && entries->kind == Json::ARRAY) {
@@ -193,10 +291,10 @@ struct Workspace {
         RootOpenFiles();
     }
 
-    void Open(const string &uri, const string &text) {
+    void Open(const string &uri, const string &text, int64_t version = 0) {
         auto path = PathOfUri(uri);
         auto key = PathKey(path);
-        open[key] = Document { CanonicalPath(path), text };
+        open[key] = Document { CanonicalPath(path), text, version };
         Touch(key);
     }
 
@@ -221,11 +319,12 @@ struct Workspace {
     // text (textDocumentSync Full, and a client that batches a save behind
     // its edits), so that a client sending fragments never reads as the
     // whole file.
-    void ChangeEdits(const string &uri, const Json &changes) {
+    void ChangeEdits(const string &uri, const Json &changes, int64_t version = 0) {
         if (changes.kind != Json::ARRAY || changes.arr.empty()) return;
         auto key = PathKey(PathOfUri(uri));
         auto it = open.find(key);
-        if (it == open.end()) return;
+        if (it == open.end() || version <= it->second.version) return;
+        it->second.version = version;
         for (auto &c : changes.arr) {
             if (c.kind != Json::OBJECT) continue;
             if (auto r = c.Get("range"); r && r->kind == Json::OBJECT)
@@ -286,25 +385,21 @@ struct Workspace {
         return it == open.end() ? nullptr : &it->second.text;
     }
 
-    // One analysis of a root: the whole program as `check` sees it, from
-    // the editor's buffers, fetching nothing. Its diagnostics are
-    // published for every file it reached; one that got past resolution
-    // replaces the analysis queries read. A cancelled one leaves the root
-    // dirty for the next; one not cancellable runs to its end.
-    void Analyze(Root &r, bool cancellable = true) {
+    // Build indexes without publishing diagnostics or changing roots.
+    unique_ptr<Analysis> AnalyzeSources(const string &entry, const SourceProvider &sources,
+                                       bool cancellable = false, bool optimize = false) {
         auto an = make_unique<Analysis>();
         an->ast = make_unique<Ast>();
         auto &ast = *an->ast;
         ast.cancel = cancellable ? &rpc.cancel : nullptr;
         ast.exemplars = true;
-        ast.sink = [&](const Diagnostic &d) { an->diags.push_back(d); };
-        SourceProvider sources = [&](const string &path) { return TextOf(path); };
+        ast.sink = [an = an.get()](const Diagnostic &d) { an->diags.push_back(d); };
         try {
             RunOnCompilerStack([&]() -> int {
                 // The parser and the checker go on past the errors they
                 // recover from, which the sink collects; the passes after
                 // the check want a program without any.
-                ParseProgram(ast, r.path, stdlibdirs, DirOf(exe), sources);
+                ParseProgram(ast, entry, stdlibdirs, DirOf(exe), sources);
                 ResolveTypeNames(ast);
                 an->parsed = true;
                 // The source's indexes stand on the tree as written, which
@@ -316,7 +411,7 @@ struct Workspace {
                 an->IndexSource();
                 TypeCheckProgram(ast, false, true);
                 an->Build();
-                if (!ast.errors.empty()) return 0;
+                if (!optimize || !ast.errors.empty()) return 0;
                 // At the level a run or build defaults to, so that the
                 // checkfree verdicts here are theirs.
                 Optimizer opt(ast, 2);
@@ -334,8 +429,21 @@ struct Workspace {
                 an->diags.insert(an->diags.end(), e.diags.begin(), e.diags.end());
             }
         } catch (Cancelled &) {
-            return;
+            return nullptr;
         }
+        return an;
+    }
+
+    // One analysis of a root: the whole program as `check` sees it, from
+    // the editor's buffers, fetching nothing. Its diagnostics are
+    // published for every file it reached; one that got past resolution
+    // replaces the analysis queries read. A cancelled one leaves the root
+    // dirty for the next; one not cancellable runs to its end.
+    void Analyze(Root &r, bool cancellable = true) {
+        SourceProvider sources = [&](const string &path) { return TextOf(path); };
+        auto an = AnalyzeSources(r.path, sources, cancellable, true);
+        if (!an) return;
+        auto &ast = *an->ast;
         r.dirty = false;
         r.files.clear();
         for (auto &[path, text] : ast.sources) r.files.insert(PathKey(path));
