@@ -589,11 +589,14 @@ inline void CodeGen::EmitSimdVersions(FnSpec *sp, const string &name, const stri
     for (int lv = SIMD_LEVELS; lv >= 1; lv--) {
         versions[lv] = Unique(cat(name, "_simd", lv));
         Append(code, "#if GS_SIMD >= ", lv,
-               "\n#undef GS_MUL_ADD_MODE\n#define GS_MUL_ADD_MODE fused\nGS_SIMD_TARGET", lv,
+               "\n#undef GS_MUL_ADD_MODE\n#define GS_MUL_ADD_MODE fused\n", DebugLine(sp->sf->line),
+               "GS_SIMD_TARGET", lv,
                " static ", ret, " ", versions[lv], "(", params, ") {\n", fnbody,
-               "}\n#undef GS_MUL_ADD_MODE\n#define GS_MUL_ADD_MODE GS_MUL_ADD_BASE\n#endif\n");
+               "}\n", DebugLine({ 1, -1, 0 }),
+               "#undef GS_MUL_ADD_MODE\n#define GS_MUL_ADD_MODE GS_MUL_ADD_BASE\n#endif\n");
     }
-    Append(code, "static ", ret, " ", name, "(", params, ") {\n",
+    Append(code, DebugLine(sp->sf->line), "static ", ret, " ", name, "(", params, ") {\n",
+           DebugLine({ 1, -1, 0 }),
            "#if GS_SIMD >= 1\n    switch (gs_simd_level()) {\n");
     for (int lv = SIMD_LEVELS; lv >= 1; lv--) {
         if (lv > 1) Append(code, "#if GS_SIMD >= ", lv, "\n");
@@ -602,7 +605,7 @@ inline void CodeGen::EmitSimdVersions(FnSpec *sp, const string &name, const stri
         else Append(code, "    case ", lv, ": return ", call, ";\n");
         if (lv > 1) Append(code, "#endif\n");
     }
-    Append(code, "    }\n#endif\n", fnbody, "}\n\n");
+    Append(code, "    }\n#endif\n", fnbody, "}\n\n", DebugLine({ 1, -1, 0 }));
 }
 
 inline void CodeGen::EmitSpec(FnSpec *sp, bool er) {
@@ -695,7 +698,7 @@ inline void CodeGen::EmitSpec(FnSpec *sp, bool er) {
     auto bodyout = ExpandTopMarkers(body, plan);
     assert(bodyout.find("@@gs") == string::npos);
     auto decls = HoistAggregateDecls(bodyout);
-    string fnbody = paramcopies + decls;
+    string fnbody = DebugLine({ 1, -1, 0 }) + paramcopies + decls;
     // A whole-body cache loads at entry; a per-loop one declares and loads
     // itself at its loop's edge.
     for (size_t i = 0; i < toporder.size(); i++)
@@ -709,8 +712,8 @@ inline void CodeGen::EmitSpec(FnSpec *sp, bool er) {
     fnbody += bodyout;
     auto name = er ? ernames[sp] : curinfo->cname;
     if (sp->sf->issimd) EmitSimdVersions(sp, name, params, fnbody);
-    else Append(code, "static ", FnAttrs(sp), SigRet(sp), " ", name, "(", params, ") {\n", fnbody,
-                "}\n\n");
+    else Append(code, DebugLine(sp->sf->line), "static ", FnAttrs(sp), SigRet(sp), " ", name, "(", params, ") {\n", fnbody,
+                "}\n\n", DebugLine({ 1, -1, 0 }));
     curspec = nullptr;
     curinfo = nullptr;
     emiter = false;
@@ -937,10 +940,10 @@ inline void CodeGen::EmitGlobalInit() {
     cscopes.clear();
     stackown[nullptr] = std::max(stackown[nullptr], stkmax);
     auto decls = HoistAggregateDecls(body);
-    Append(code, "static void gs_init_globals(void) {\n");
+    Append(code, DebugLine({ 1, -1, 0 }), "static void gs_init_globals(void) {\n");
     code += decls;
     code += body;
-    code += "}\n\n";
+    Append(code, "}\n\n", DebugLine({ 1, -1, 0 }));
 }
 
 // x, a pure expression, as a value of index or bound type t: checked below

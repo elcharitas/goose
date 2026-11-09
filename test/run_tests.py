@@ -1110,6 +1110,8 @@ class Runner:
         # naming the shape (optimize_loops.h, BCE's lenbound). Every shape_
         # function of the fixture must have the one it is named for, and no
         # keep_ function any.
+        text = re.sub(r'^#line \d+ "(?:[^"\\]|\\.)*"\n',
+                      '', text, flags=re.MULTILINE)
         bodies = {}
         texts = {}
         for m in re.finditer(r"^static [^\n;]*?\b((?:shape|keep)_\w+?)_g\d*\([^\n]*\) \{\n(.*?)^\}\n",
@@ -2200,6 +2202,7 @@ def main():
                     r.fail(f"mul_add-clang{gopt} {name}.goose", out + err)
                     continue
                 ctext = src.read_text(encoding="utf-8")
+                ctext = re.sub(r'^#line \d+ "(?:[^"\\]|\\.)*"\n', '', ctext, flags=re.MULTILINE)
                 if not re.search(r"#define GS_MUL_ADD_MODE fused\nGS_SIMD_TARGET1 static [^\n]*"
                                  r"\bdirect_g\w*_simd1\(", ctext):
                     r.fail(f"mul_add-clang{gopt} {name}.goose", "no fused mode around the AVX2 version")
@@ -2672,6 +2675,19 @@ def main():
     r.show_task(lsp_protocol)
 
     r.section("native builds, packages and runtime I/O")
+
+    def source_debug():
+        from source_debug import check_source_debug
+        try:
+            skipped = check_source_debug(exe, gendir)
+            if skipped:
+                r.say(f"skip source debugging ({skipped})")
+            else:
+                r.ok("native debug locations in Goose source and imported files")
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            r.fail("source debugging", str(e))
+    if cc:
+        r.show_task(source_debug)
 
     def extern_types():
         from extern_types import check_extern_types
